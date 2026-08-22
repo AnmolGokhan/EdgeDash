@@ -1,0 +1,93 @@
+# EdgeDash user configuration
+# Edit this file to match your profile. Never put secrets here.
+
+# The job title you are targeting
+target_role: "AI Engineer"
+
+target_seniority: "mid"
+
+# City used to filter listings
+target_city: "Bengaluru"
+
+# Keywords passed to job-board search queries
+keywords:
+  - "AI Engineer"
+  - "Machine Learning Engineer"
+  - "Generative AI Engineer"
+  - "GenAI Engineer"
+  - "LLM Engineer"
+  - "NLP Engineer"
+  - "Agentic AI"
+  - "LangChain"
+  - "LangGraph"
+  - "RAG"
+  - "Python"
+  - "FastAPI"
+
+# Your current skills — used by the Scorer and GapAnalyzer
+# `skills` is the authoritative list used by scoring; `my_skills` remains for compatibility
+skills:
+  - "Python"
+  - "Machine Learning"
+  - "Deep Learning"
+  - "Natural Language Processing"
+  - "Transformers"
+  - "LLMs"
+  - "RAG"
+  - "LangChain"
+  - "LangGraph"
+  - "Agentic AI"
+  - "Hugging Face"
+  - "scikit-learn"
+  - "TensorFlow"
+  - "FastAPI"
+  - "Git"
+  - "GitHub"
+
+my_skills:
+  - "Python"
+  - "Machine Learning"
+  - "Deep Learning"
+  - "Natural Language Processing"
+  - "Transformers"
+  - "LLMs"
+  - "RAG"
+  - "LangChain"
+  - "LangGraph"
+  - "Agentic AI"
+  - "Hugging Face"
+  - "scikit-learn"
+  - "TensorFlow"
+  - "FastAPI"
+  - "Git"
+  - "GitHub"
+
+# Years of relevant experience
+experience_years: 0
+
+# SQLite database file path (relative to repo root)
+db_path: "edgedash.db"
+
+# Listings with a fit score below this threshold are filtered out of the dashboard
+min_fit_score: 55
+
+# Enabled job-board sources (must match names in the SOURCES registry)
+# "apify" requires APIFY_TOKEN in .env
+sources:
+  - "arbeitnow"
+  # - "apify"
+
+# Set to true to use MockFetcher instead of the real Fetcher (offline dev mode)
+use_mock_fetcher: false
+
+# LLM settings — provider and model come from config, never hardcoded
+llm_provider: "gemini"          # "gemini" or "ollama"
+llm_model: "gemini-3.6-flash"   # model name passed to the provider
+llm_requests_per_minute: 15     # free-tier cap; lower if you see 429s
+
+# Scoring
+scoring_batch_size: 25          # max listings scored per cycle (rule 21)
+skill_match_weight: 0.45
+seniority_fit_weight: 0.25
+location_fit_weight: 0.15
+recency_weight: 0.15
