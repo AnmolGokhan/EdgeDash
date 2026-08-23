@@ -23,7 +23,7 @@ from edgedash.sources.base import register
 from edgedash.sources.http import SourceError, get_json
 
 _API_URL = "https://www.arbeitnow.com/api/job-board-api"
-_MAX_PAGES = 5
+_MAX_PAGES = 5  # hard cap: a retry storm cannot expand pagination
 _MIN_RESULTS_BEFORE_RELAXING_LOCATION = 5
 _REQUEST_INTERVAL = 1.0  # seconds between requests (steering rule 14)
 
@@ -74,12 +74,13 @@ class ArbeitnowSource:
         """Fetch up to _MAX_PAGES from Arbeitnow and return filtered rows."""
         all_raw: list[dict[str, Any]] = []
 
-        for page in range(1, _MAX_PAGES + 1):
+        max_pages = min(_MAX_PAGES, int(getattr(config, "max_pages", _MAX_PAGES)))
+        for page in range(1, max_pages + 1):
             try:
                 data = get_json(_API_URL, params={"page": page})
             except SourceError:
-                print(f"  [arbeitnow] page {page} failed, stopping pagination.")
-                break
+                print(f"  [arbeitnow] page {page} failed.")
+                raise
 
             items: list[dict[str, Any]] = data.get("data", [])
             print(f"  [arbeitnow] page {page}: {len(items)} raw listings")
@@ -97,7 +98,7 @@ class ArbeitnowSource:
                 print(f"  [arbeitnow] no keyword matches on page {page}, stopping.")
                 break
 
-            if page < _MAX_PAGES:
+            if page < max_pages:
                 time.sleep(_REQUEST_INTERVAL)
 
         print(

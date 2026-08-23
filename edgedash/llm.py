@@ -196,6 +196,19 @@ def _validate(data: Any, schema: dict) -> None:
     We intentionally avoid jsonschema to stay stdlib-first; this covers
     the structural checks our scorer needs (required fields, no extras).
     """
+    expected_type = schema.get("type")
+    if expected_type == "array":
+        if not isinstance(data, list):
+            raise ValueError(f"Expected a JSON array, got {type(data).__name__}")
+        item_schema = schema.get("items")
+        if item_schema:
+            for index, item in enumerate(data):
+                try:
+                    _validate(item, item_schema)
+                except ValueError as exc:
+                    raise ValueError(f"Invalid array item {index}: {exc}") from exc
+        return
+
     if not isinstance(data, dict):
         raise ValueError(f"Expected a JSON object, got {type(data).__name__}")
 
@@ -217,6 +230,9 @@ def _validate(data: Any, schema: dict) -> None:
             if "null" in allowed_types:
                 continue
             raise ValueError(f"Key '{key}' cannot be null")
+
+        if "enum" in spec and value not in spec["enum"]:
+            raise ValueError(f"Key '{key}' must be one of: {', '.join(spec['enum'])}")
 
         if "string" in allowed_types and isinstance(value, str):
             continue
@@ -246,8 +262,8 @@ def complete_json(
     schema: dict,
     *,
     max_retries: int = 1,
-) -> dict:
-    """Send prompt to the configured LLM and return a validated JSON dict.
+) -> Any:
+    """Send prompt to the configured LLM and return validated JSON data.
 
     Args:
         prompt:      The full prompt text to send.
@@ -257,7 +273,7 @@ def complete_json(
                      (default 1 per steering rule 17).
 
     Returns:
-        A dict matching the schema.
+        JSON data matching the schema.
 
     Raises:
         LLMError: If the response cannot be parsed and validated after all

@@ -2,29 +2,31 @@
 
 from __future__ import annotations
 
-import json
 from datetime import datetime, timezone
 from typing import Any
+
+from edgedash.skills import canonical
 
 
 SENIORITY_ORDER = ["junior", "mid", "senior", "lead"]
 
 
-def _clean_skill(value: Any) -> str:
-    return str(value).strip().lower()
+def _clean_skill(value: Any, aliases: dict[str, str] | None = None) -> str:
+    return canonical(str(value), aliases or {})
 
 
-def _skill_set(items: Any) -> set[str]:
+def _skill_set(items: Any, aliases: dict[str, str] | None = None) -> set[str]:
     if not isinstance(items, list):
         return set()
-    return {_clean_skill(item) for item in items if str(item).strip()}
+    return {_clean_skill(item, aliases) for item in items if str(item).strip()}
 
 
 def _config_skills(config: Any) -> list[str]:
+    aliases = getattr(config, "skill_aliases", {})
     if hasattr(config, "skills"):
-        return [str(skill).strip().lower() for skill in getattr(config, "skills") if str(skill).strip()]
+        return [_clean_skill(skill, aliases) for skill in getattr(config, "skills") if str(skill).strip()]
     if hasattr(config, "my_skills"):
-        return [str(skill).strip().lower() for skill in getattr(config, "my_skills") if str(skill).strip()]
+        return [_clean_skill(skill, aliases) for skill in getattr(config, "my_skills") if str(skill).strip()]
     return []
 
 
@@ -32,12 +34,16 @@ def _normalise_float(value: float, digits: int = 3) -> float:
     return round(float(value), digits)
 
 
-def _skill_match_component(facts: dict[str, Any], config: Any) -> float:
+def _skill_match_component(
+    facts: dict[str, Any], config: Any, strict_distribution: bool = False
+) -> float:
     required = [
-        _clean_skill(skill) for skill in (facts.get("required_skills") or []) if str(skill).strip()
+        _clean_skill(skill, getattr(config, "skill_aliases", {}))
+        for skill in (facts.get("required_skills") or []) if str(skill).strip()
     ]
     nice = [
-        _clean_skill(skill) for skill in (facts.get("nice_to_have") or []) if str(skill).strip()
+        _clean_skill(skill, getattr(config, "skill_aliases", {}))
+        for skill in (facts.get("nice_to_have") or []) if str(skill).strip()
     ]
     profile = set(_config_skills(config))
 
@@ -54,7 +60,8 @@ def _skill_match_component(facts: dict[str, Any], config: Any) -> float:
     nice_count = len(nice)
     nice_matches = sum(1 for skill in nice if skill in profile)
     nice_fraction = nice_matches / nice_count
-    return min(1.0, required_fraction + (nice_fraction * 0.3333333333))
+    result = min(1.0, required_fraction + (nice_fraction * 0.3333333333))
+    return min(result, 0.8) if strict_distribution else result
 
 
 def _seniority_fit_component(facts: dict[str, Any], config: Any) -> float:
@@ -101,26 +108,24 @@ def _location_fit_component(listing: dict[str, Any], facts: dict[str, Any], conf
     return 0.1
 
 
-def _recency_component(listing: dict[str, Any]) -> float:
-    posted_at = listing.get("posted_at")
-    if posted_at is None or posted_at == "":
-        return 0.5
-
+def _parse_datetime(value: Any) -> datetime | None:
+    if value is None or value == "":
+        return None
     try:
-        if isinstance(posted_at, str):
-            if posted_at.endswith("Z"):
-                posted_at = posted_at[:-1] + "+00:00"
-            posted_dt = datetime.fromisoformat(posted_at)
-        else:
-            posted_dt = datetime.fromisoformat(str(posted_at))
+        if isinstance(value, str):
+            value = value.replace("Z", "+00:00") if value.endswith("Z") else value
+        parsed = datetime.fromisoformat(str(value))
     except ValueError:
+        return None
+    return parsed.replace(tzinfo=timezone.utc) if parsed.tzinfo is None else parsed
+
+
+def _recency_component(listing: dict[str, Any], as_of: datetime) -> float:
+    posted_at = listing.get("posted_at")
+    posted_dt = _parse_datetime(posted_at)
+    if posted_dt is None:
         return 0.5
-
-    if posted_dt.tzinfo is None:
-        posted_dt = posted_dt.replace(tzinfo=timezone.utc)
-
-    now = datetime.now(timezone.utc)
-    age_days = max(0.0, (now - posted_dt).total_seconds() / 86400.0)
+    age_days = max(0.0, (as_of - posted_dt).total_seconds() / 86400.0)
     if age_days <= 0:
         return 1.0
     if age_days >= 30:
@@ -144,30 +149,27 @@ def _weighted_score(components: dict[str, float], config: Any) -> int:
     return max(0, min(100, int(round(total * 100))))
 
 
-def _days_ago_text(posted_at: Any) -> str:
+def _days_ago_text(posted_at: Any, as_of: datetime) -> str:
     if posted_at is None or posted_at == "":
         return "posted unknown"
 
-    try:
-        if isinstance(posted_at, str):
-            if posted_at.endswith("Z"):
-                posted_at = posted_at[:-1] + "+00:00"
-            posted_dt = datetime.fromisoformat(posted_at)
-        else:
-            posted_dt = datetime.fromisoformat(str(posted_at))
-    except ValueError:
+    posted_dt = _parse_datetime(posted_at)
+    if posted_dt is None:
         return "posted unknown"
-
-    if posted_dt.tzinfo is None:
-        posted_dt = posted_dt.replace(tzinfo=timezone.utc)
-
-    age_days = max(0.0, (datetime.now(timezone.utc) - posted_dt).total_seconds() / 86400.0)
+    age_days = max(0.0, (as_of - posted_dt).total_seconds() / 86400.0)
     rounded = max(0, int(round(age_days)))
     return f"posted {rounded}d ago"
 
 
-def build_reason(components: dict[str, float], facts: dict[str, Any], config: Any) -> str:
-    required = [str(skill).strip().lower() for skill in (facts.get("required_skills") or []) if str(skill).strip()]
+def build_reason(
+    components: dict[str, float],
+    facts: dict[str, Any],
+    config: Any,
+    as_of: datetime,
+    listing: dict[str, Any] | None = None,
+) -> str:
+    aliases = getattr(config, "skill_aliases", {})
+    required = [_clean_skill(skill, aliases) for skill in (facts.get("required_skills") or []) if str(skill).strip()]
     profile = set(_config_skills(config))
     matched_required = sum(1 for skill in required if skill in profile)
 
@@ -177,9 +179,8 @@ def build_reason(components: dict[str, float], facts: dict[str, Any], config: An
 
     location_text = "remote" if bool(facts.get("remote_ok")) else "location fit" if components["location_fit"] >= 0.9 else "location mismatch"
 
-    recency_text = _days_ago_text((facts.get("posted_at") if isinstance(facts, dict) else None))
-    if not isinstance(facts, dict):
-        recency_text = "posted unknown"
+    posted_at = listing.get("posted_at") if listing is not None else None
+    recency_text = _days_ago_text(posted_at, as_of)
 
     missing = [skill for skill in required if skill not in profile]
     pieces = [required_part, seniority_text, location_text, recency_text]
@@ -188,15 +189,22 @@ def build_reason(components: dict[str, float], facts: dict[str, Any], config: An
     return " · ".join(pieces)
 
 
-def score_listing(listing: dict[str, Any], facts: dict[str, Any], config: Any) -> dict[str, Any]:
+def score_listing(
+    listing: dict[str, Any],
+    facts: dict[str, Any],
+    config: Any,
+    *,
+    as_of: datetime,
+    strict_distribution: bool = False,
+) -> dict[str, Any]:
     """Compute a deterministic score and reason from extracted listing facts."""
     components = {
-        "skill_match": _skill_match_component(facts, config),
+        "skill_match": _skill_match_component(facts, config, strict_distribution),
         "seniority_fit": _seniority_fit_component(facts, config),
         "location_fit": _location_fit_component(listing, facts, config),
-        "recency": _recency_component(listing),
+        "recency": _recency_component(listing, as_of),
     }
     components = {key: _normalise_float(value) for key, value in components.items()}
     score = _weighted_score(components, config)
-    reason = build_reason(components, facts, config)
+    reason = build_reason(components, facts, config, as_of, listing)
     return {"score": score, "reason": reason, "components": components}

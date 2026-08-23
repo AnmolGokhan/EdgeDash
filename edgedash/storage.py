@@ -11,6 +11,7 @@ import json
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Generator, Sequence
 
 
@@ -37,6 +38,18 @@ def _connect(path: str) -> Generator[sqlite3.Connection, None, None]:
         conn.close()
 
 
+@contextmanager
+def _connect_readonly(path: str) -> Generator[sqlite3.Connection, None, None]:
+    """Open SQLite without allowing a read-only diagnostic to write."""
+    uri = f"file:{Path(path).resolve().as_posix()}?mode=ro"
+    conn = sqlite3.connect(uri, uri=True)
+    conn.row_factory = sqlite3.Row
+    try:
+        yield conn
+    finally:
+        conn.close()
+
+
 # ---------------------------------------------------------------------------
 # Schema
 # ---------------------------------------------------------------------------
@@ -59,9 +72,16 @@ CREATE TABLE IF NOT EXISTS listings (
 );
 
 CREATE TABLE IF NOT EXISTS skill_gaps (
-    skill       TEXT PRIMARY KEY,
-    frequency   INTEGER NOT NULL DEFAULT 0,
-    last_seen   TEXT
+    run_id              TEXT NOT NULL,
+    computed_at         TEXT NOT NULL,
+    skill               TEXT NOT NULL,
+    listings_blocked    INTEGER NOT NULL,
+    opportunity_cost    REAL NOT NULL,
+    mean_score          REAL NOT NULL,
+    top_score           INTEGER NOT NULL,
+    example_ids         TEXT NOT NULL,
+    also_nice_to_have   INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (run_id, skill)
 );
 
 CREATE TABLE IF NOT EXISTS extraction_cache (
@@ -112,10 +132,42 @@ def _migrate_extraction_cache(conn: sqlite3.Connection) -> None:
         )
 
 
+def _migrate_listing_scores(conn: sqlite3.Connection) -> None:
+    """Add score columns to databases created before component scoring."""
+    columns = {
+        row[1] for row in conn.execute("PRAGMA table_info(listings)").fetchall()
+    }
+    for name, definition in (
+        ("scored_at", "TEXT"),
+        ("components", "TEXT"),
+    ):
+        if name not in columns:
+            conn.execute(f"ALTER TABLE listings ADD COLUMN {name} {definition}")
+
+
+def _migrate_skill_gaps(conn: sqlite3.Connection) -> None:
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(skill_gaps)").fetchall()}
+    if columns and "run_id" not in columns:
+        conn.execute("ALTER TABLE skill_gaps RENAME TO skill_gaps_legacy")
+        conn.execute(
+            """
+            CREATE TABLE skill_gaps (
+                run_id TEXT NOT NULL, computed_at TEXT NOT NULL, skill TEXT NOT NULL,
+                listings_blocked INTEGER NOT NULL, opportunity_cost REAL NOT NULL,
+                mean_score REAL NOT NULL, top_score INTEGER NOT NULL,
+                example_ids TEXT NOT NULL, also_nice_to_have INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (run_id, skill)
+            )
+            """
+        )
+
+
 def init_db(path: str) -> None:
     """Create all tables if they do not already exist."""
     with _connect(path) as conn:
         conn.executescript(_DDL)
+        _migrate_listing_scores(conn)
+        _migrate_skill_gaps(conn)
         _migrate_extraction_cache(conn)
 
 
@@ -209,11 +261,118 @@ def set_extraction_cache(path: str, description_hash: str, payload: dict[str, An
         )
 
 
+def get_extracted_skill_counts(path: str) -> list[dict[str, Any]]:
+    """Return raw required-skill counts from extraction cache payloads."""
+    with _connect_readonly(path) as conn:
+        rows = conn.execute(
+            """
+            SELECT json_each.value AS skill, COUNT(*) AS count
+            FROM extraction_cache, json_each(extraction_cache.payload, '$.required_skills')
+            WHERE json_each.type = 'text'
+            GROUP BY json_each.value
+            ORDER BY count DESC, skill COLLATE NOCASE
+            """
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def get_scored_listings_with_facts(path: str) -> list[dict[str, Any]]:
+    """Return scored listings joined to their cached extracted facts."""
+    with _connect(path) as conn:
+        listings = conn.execute(
+            "SELECT id, description, fit_score FROM listings WHERE fit_score IS NOT NULL"
+        ).fetchall()
+        result: list[dict[str, Any]] = []
+        for listing in listings:
+            digest = hashlib.sha256((listing["description"] or "").strip().encode("utf-8")).hexdigest()
+            cached = conn.execute(
+                "SELECT payload FROM extraction_cache WHERE description_hash = ?", (digest,)
+            ).fetchone()
+            if cached is None:
+                continue
+            facts = json.loads(cached["payload"])
+            result.append({"id": listing["id"], "fit_score": listing["fit_score"], **facts})
+    return result
+
+
+def write_skill_gap_snapshot(path: str, run_id: str, computed_at: str, rows: Sequence[dict[str, Any]]) -> None:
+    """Append a timestamped skill-gap snapshot without replacing prior runs."""
+    with _connect(path) as conn:
+        conn.executemany(
+            """
+            INSERT INTO skill_gaps
+                (run_id, computed_at, skill, listings_blocked, opportunity_cost,
+                 mean_score, top_score, example_ids, also_nice_to_have)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    run_id, computed_at, row["skill"], row["listings_blocked"],
+                    row["opportunity_cost"], row["mean_score"], row["top_score"],
+                    json.dumps(row["example_ids"]), row["also_nice_to_have"],
+                )
+                for row in rows
+            ],
+        )
+
+
+def get_latest_skill_gap_snapshot(path: str) -> list[dict[str, Any]]:
+    """Return the most recent persisted skill-gap snapshot."""
+    with _connect(path) as conn:
+        run = conn.execute("SELECT run_id FROM skill_gaps ORDER BY computed_at DESC LIMIT 1").fetchone()
+        if run is None:
+            return []
+        rows = conn.execute(
+            "SELECT * FROM skill_gaps WHERE run_id = ? ORDER BY opportunity_cost DESC",
+            (run["run_id"],),
+        ).fetchall()
+    result = [dict(row) for row in rows]
+    for row in result:
+        row["example_ids"] = json.loads(row["example_ids"])
+    return result
+
+
+def get_skill_gap_snapshots(path: str) -> list[dict[str, Any]]:
+    """Return all persisted skill-gap snapshots in chronological order."""
+    with _connect(path) as conn:
+        rows = conn.execute(
+            """
+            SELECT * FROM skill_gaps
+            ORDER BY computed_at ASC, run_id ASC, opportunity_cost DESC, skill ASC
+            """
+        ).fetchall()
+
+    snapshots: list[dict[str, Any]] = []
+    for row in rows:
+        data = dict(row)
+        data["example_ids"] = json.loads(data["example_ids"])
+        if not snapshots or snapshots[-1]["run_id"] != data["run_id"]:
+            snapshots.append(
+                {
+                    "run_id": data["run_id"],
+                    "computed_at": data["computed_at"],
+                    "rows": [],
+                }
+            )
+        snapshots[-1]["rows"].append(data)
+    return snapshots
+
+
 def get_unscored_listings(path: str, limit: int = 25) -> list[dict[str, Any]]:
     """Return unscored listings, oldest-first or insertion order for scoring."""
     with _connect(path) as conn:
         rows = conn.execute(
             "SELECT * FROM listings WHERE fit_score IS NULL ORDER BY fetched_at ASC, id ASC LIMIT ?",
+            (limit,),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def get_scored_listings(path: str, limit: int = 25) -> list[dict[str, Any]]:
+    """Return scored listings for an explicit operator retry."""
+    with _connect(path) as conn:
+        rows = conn.execute(
+            "SELECT * FROM listings WHERE fit_score IS NOT NULL ORDER BY scored_at ASC, id ASC LIMIT ?",
             (limit,),
         ).fetchall()
     return [dict(row) for row in rows]
@@ -249,6 +408,82 @@ def update_listing_score(
         )
 
 
+def clear_listing_scores(path: str, listing_id: str | None = None) -> int:
+    """Clear score fields without deleting extraction cache or listing data."""
+    query = """
+        UPDATE listings
+        SET fit_score = NULL,
+            fit_reason = NULL,
+            scored_at = NULL,
+            components = NULL
+    """
+    params: tuple[str, ...] = ()
+    if listing_id is not None:
+        query += " WHERE id = ?"
+        params = (listing_id,)
+
+    with _connect(path) as conn:
+        cursor = conn.execute(query, params)
+    return int(cursor.rowcount)
+
+
+def get_listing_diagnostics(path: str) -> dict[str, Any]:
+    """Return a read-only summary of listings for operational diagnostics."""
+    with _connect(path) as conn:
+        total = conn.execute("SELECT COUNT(*) FROM listings").fetchone()[0]
+
+        source_counts = conn.execute(
+            "SELECT source, COUNT(*) FROM listings GROUP BY source ORDER BY source"
+        ).fetchall()
+
+        duplicate_rows = conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM (
+                SELECT LOWER(TRIM(COALESCE(title, ''))) AS title_norm,
+                       LOWER(TRIM(COALESCE(company, ''))) AS company_norm,
+                       COUNT(DISTINCT source) AS source_count,
+                       COUNT(*) AS row_count
+                FROM listings
+                WHERE COALESCE(title, '') <> '' OR COALESCE(company, '') <> ''
+                GROUP BY LOWER(TRIM(COALESCE(title, ''))), LOWER(TRIM(COALESCE(company, '')))
+                HAVING COUNT(DISTINCT source) > 1
+            )
+            """
+        ).fetchone()[0]
+
+        recent = conn.execute(
+            """
+            SELECT source, title, company, fetched_at, posted_at
+            FROM listings
+            ORDER BY COALESCE(fetched_at, '0000-00-00T00:00:00Z') DESC, id DESC
+            LIMIT 5
+            """
+        ).fetchall()
+
+        bad_rows = conn.execute(
+            """
+            SELECT source, title, company, url
+            FROM listings
+            WHERE url IS NULL
+               OR TRIM(COALESCE(url, '')) = ''
+               OR title IS NULL
+               OR TRIM(COALESCE(title, '')) = ''
+               OR company IS NULL
+               OR TRIM(COALESCE(company, '')) = ''
+            ORDER BY fetched_at DESC NULLS LAST, id DESC
+            """
+        ).fetchall()
+
+    return {
+        "total_listings": int(total),
+        "source_counts": [dict(row) for row in source_counts],
+        "probable_cross_source_duplicates": int(duplicate_rows),
+        "recent": [dict(row) for row in recent],
+        "data_quality_issues": [dict(row) for row in bad_rows],
+    }
+
+
 def count_unscored(path: str) -> int:
     """Return the number of listings that have not yet been scored."""
     with _connect(path) as conn:
@@ -265,6 +500,155 @@ def last_fetch_time(path: str) -> str | None:
             "SELECT MAX(fetched_at) FROM listings"
         ).fetchone()
     return row[0]
+
+
+def get_state_metrics(path: str) -> dict[str, Any]:
+    """Return aggregate timestamps and counts needed to build system state."""
+    with _connect_readonly(path) as conn:
+        row = conn.execute(
+            """
+            SELECT
+                (SELECT MAX(fetched_at) FROM listings) AS last_fetch_at,
+                (SELECT COUNT(*) FROM listings WHERE fit_score IS NULL) AS unscored_count,
+                (SELECT MAX(scored_at) FROM listings WHERE scored_at IS NOT NULL) AS latest_score_at,
+                (SELECT MAX(computed_at) FROM skill_gaps) AS gaps_computed_at,
+                (SELECT status FROM cycle_log ORDER BY id DESC LIMIT 1) AS last_cycle_verdict,
+                (SELECT finished_at FROM cycle_log ORDER BY id DESC LIMIT 1) AS last_cycle_at
+            """
+        ).fetchone()
+    return dict(row)
+
+
+def get_verification_inputs(path: str) -> dict[str, Any]:
+    """Read current scores, cached facts, latest gaps, and fetch timestamp."""
+    with _connect_readonly(path) as conn:
+        listings = conn.execute(
+            "SELECT id, description, fit_score FROM listings WHERE fit_score IS NOT NULL"
+        ).fetchall()
+        cache_rows = conn.execute(
+            "SELECT description_hash, payload FROM extraction_cache"
+        ).fetchall()
+        latest_gap = conn.execute(
+            "SELECT run_id FROM skill_gaps ORDER BY computed_at DESC LIMIT 1"
+        ).fetchone()
+        gaps = []
+        if latest_gap is not None:
+            gaps = conn.execute(
+                "SELECT skill, listings_blocked, opportunity_cost FROM skill_gaps WHERE run_id = ? ORDER BY opportunity_cost DESC",
+                (latest_gap["run_id"],),
+            ).fetchall()
+        latest_fetch = conn.execute("SELECT MAX(fetched_at) FROM listings").fetchone()[0]
+
+    facts_by_hash = {row["description_hash"]: json.loads(row["payload"]) for row in cache_rows}
+    facts_list: list[dict[str, Any]] = []
+    scores: list[int] = []
+    for listing in listings:
+        digest = hashlib.sha256((listing["description"] or "").strip().encode("utf-8")).hexdigest()
+        facts = facts_by_hash.get(digest)
+        if facts is not None:
+            facts_list.append(facts)
+        scores.append(int(listing["fit_score"]))
+    return {
+        "scores": scores,
+        "facts_list": facts_list,
+        "gaps": [dict(row) for row in gaps],
+        "latest_fetch_at": latest_fetch,
+    }
+
+
+def get_latest_passing_cycle(path: str) -> dict[str, Any] | None:
+    """Return the latest cycle summary whose verdict passed verification."""
+    with _connect_readonly(path) as conn:
+        row = conn.execute(
+            """
+            SELECT * FROM cycle_log
+            WHERE agent = 'Orchestrator/Summary' AND status = 'complete'
+            ORDER BY id DESC LIMIT 1
+            """
+        ).fetchone()
+    return dict(row) if row is not None else None
+
+
+def get_cycle_activity(path: str, limit: int = 30) -> list[dict[str, Any]]:
+    """Return the most recent cycle-log rows for the read-only dashboard."""
+    with _connect_readonly(path) as conn:
+        rows = conn.execute(
+            """
+            SELECT * FROM cycle_log
+            WHERE agent = 'Orchestrator/Summary'
+            ORDER BY id DESC LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def get_verification_history(path: str, limit: int = 20) -> list[dict[str, Any]]:
+    """Return recent orchestrator summaries for the read-only verdict view."""
+    with _connect_readonly(path) as conn:
+        rows = conn.execute(
+            """
+            SELECT id, started_at, finished_at, status, notes
+            FROM cycle_log
+            WHERE agent = 'Orchestrator/Summary'
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def get_latest_cycle_summary(path: str) -> dict[str, Any] | None:
+    """Return the newest orchestrator summary, regardless of its outcome."""
+    with _connect_readonly(path) as conn:
+        row = conn.execute(
+            "SELECT * FROM cycle_log WHERE agent = 'Orchestrator/Summary' ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+    return dict(row) if row is not None else None
+
+
+def get_passing_cycle_data(path: str, summary_finished_at: str) -> dict[str, Any]:
+    """Return listings and gaps no newer than a passing cycle summary."""
+    with _connect_readonly(path) as conn:
+        listings = conn.execute(
+            """
+            SELECT score.id, score.fit_score, score.fit_reason, listing.title, listing.company
+            FROM listings AS score
+            JOIN listings AS listing ON listing.id = score.id
+            WHERE score.fit_score IS NOT NULL AND score.scored_at <= ?
+            ORDER BY score.fit_score DESC, score.id
+            LIMIT 10
+            """,
+            (summary_finished_at,),
+        ).fetchall()
+        gaps = conn.execute(
+            """
+            SELECT skill, listings_blocked, opportunity_cost, mean_score
+            FROM skill_gaps
+            WHERE computed_at = (
+                SELECT MAX(computed_at) FROM skill_gaps WHERE computed_at <= ?
+            )
+            ORDER BY opportunity_cost DESC, skill
+            LIMIT 10
+            """,
+            (summary_finished_at,),
+        ).fetchall()
+        counts = conn.execute(
+            """
+            SELECT COUNT(*) AS total_listings,
+                   SUM(CASE WHEN fit_score IS NOT NULL THEN 1 ELSE 0 END) AS total_scored
+            FROM listings
+            WHERE fetched_at <= ?
+            """,
+            (summary_finished_at,),
+        ).fetchone()
+    return {
+        "listings": [dict(row) for row in listings],
+        "gaps": [dict(row) for row in gaps],
+        "total_listings": int(counts["total_listings"] or 0),
+        "total_scored": int(counts["total_scored"] or 0),
+    }
 
 
 def log_cycle(

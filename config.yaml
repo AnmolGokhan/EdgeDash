@@ -62,6 +62,25 @@ my_skills:
   - "Git"
   - "GitHub"
 
+# This alias map is MINE to edit; adding entries is expected as I see my own data.
+skill_aliases:
+  k8s: "kubernetes"
+  js: "javascript"
+  node: "node"
+  nodejs: "node"
+  "node.js": "node"
+  postgres: "postgres"
+  postgresql: "postgres"
+  psql: "postgres"
+  gcp: "gcp"
+  "google cloud": "gcp"
+  "google cloud platform": "gcp"
+  ml: "machine learning"
+  "machine learning": "machine learning"
+  "ci/cd": "ci/cd"
+  "ci cd": "ci/cd"
+  cicd: "ci/cd"
+
 # Years of relevant experience
 experience_years: 0
 
@@ -87,6 +106,25 @@ llm_requests_per_minute: 15     # free-tier cap; lower if you see 429s
 
 # Scoring
 scoring_batch_size: 25          # max listings scored per cycle (rule 21)
+fetch_interval_hours: 6
+max_pages: 5
+max_listings: 500
+score_max_seconds: 300
+analyse_max_seconds: 60
+# Catches verification work running beyond its bounded delegation.
+verify_max_seconds: 60
+# Catches inflated scores with too little variation.
+min_score_spread: 10
+# Catches an extractor/scorer run producing nearly identical scores.
+min_score_stdev: 5
+# Catches an extractor that returns no required skills for too many listings.
+max_empty_extraction_pct: 0.20
+# Catches a model returning sentences or junk as a skill list.
+max_skills_per_listing: 20
+# Catches gap rankings based on too few supporting listings.
+min_gap_sample: 3
+# Catches stale source data being presented as fresh.
+max_data_age_days: 3
 skill_match_weight: 0.45
 seniority_fit_weight: 0.25
 location_fit_weight: 0.15

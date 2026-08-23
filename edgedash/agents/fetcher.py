@@ -11,6 +11,7 @@ implementation.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime, timezone
 
 import edgedash.storage as storage
@@ -30,9 +31,16 @@ def _now_iso() -> str:
 class Fetcher:
     name: str = "Fetcher"
 
-    def run(self, config: Config, db_path: str) -> AgentResult:
+    def run(
+        self,
+        config: Config,
+        db_path: str,
+        goal: str,
+        stop_conditions: dict[str, int],
+    ) -> AgentResult:
         source_summaries: list[str] = []
         all_rows: list[dict] = []
+        source_config = replace(config, max_pages=stop_conditions.get("max_pages", config.max_pages))
 
         for source_name in config.sources:
             if source_name not in SOURCES:
@@ -54,7 +62,7 @@ class Fetcher:
             started_at = _now_iso()
 
             try:
-                rows = source.fetch(config)
+                rows = source.fetch(source_config)
             except Exception as exc:  # steering rule 12: never kill the cycle
                 finished_at = _now_iso()
                 short = type(exc).__name__
@@ -91,7 +99,8 @@ class Fetcher:
                 }
                 for r in rows
             ]
-            all_rows.extend(storage_rows)
+            remaining = max(0, stop_conditions.get("max_listings", len(all_rows)) - len(all_rows))
+            all_rows.extend(storage_rows[:remaining])
 
             storage.log_cycle(
                 path=db_path,

@@ -2,7 +2,7 @@
 
 All network calls go through get_json(). It enforces:
 - 10 s timeout
-- 2 retries with exponential backoff (1 s, then 2 s)
+- 2 retries for timeouts and 429 responses with exponential backoff (1 s, then 2 s)
 - A real User-Agent header
 - Raises SourceError (never swallows failures silently)
 """
@@ -66,8 +66,11 @@ def get_json(
         except requests.exceptions.Timeout as exc:
             last_error = exc
         except requests.exceptions.HTTPError as exc:
-            # Don't retry 4xx errors — they won't fix themselves.
             status = exc.response.status_code if exc.response is not None else "?"
+            if status == 429:
+                last_error = exc
+                continue
+            # Other 4xx errors are not transient and should fail immediately.
             raise SourceError(
                 f"HTTP {status} from {url}: {exc}"
             ) from exc

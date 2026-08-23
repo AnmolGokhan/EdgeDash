@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import statistics
+import time
 from datetime import datetime, timezone
 from typing import Any
 
@@ -20,16 +21,29 @@ def _now_iso() -> str:
 class Scorer:
     name: str = "Scorer"
 
-    def run(self, config: Config, db_path: str) -> AgentResult:
+    def run(
+        self,
+        config: Config,
+        db_path: str,
+        goal: str,
+        stop_conditions: dict[str, int],
+    ) -> AgentResult:
         started_at = _now_iso()
+        as_of = datetime.fromisoformat(started_at)
         failed = 0
         scored_rows: list[int] = []
 
-        rows = storage.get_unscored_listings(db_path, limit=config.scoring_batch_size)
+        max_items = stop_conditions.get("max_items", config.scoring_batch_size)
+        deadline = time.monotonic() + stop_conditions.get("max_seconds", 0) if stop_conditions.get("max_seconds") else None
+        retry = bool(stop_conditions.get("rescore"))
+        rows = storage.get_scored_listings(db_path, limit=max_items) if retry else storage.get_unscored_listings(db_path, limit=max_items)
+        strict_distribution = bool(stop_conditions.get("strict_distribution"))
         for row in rows:
+            if deadline is not None and time.monotonic() >= deadline:
+                break
             try:
                 facts = extract(row)
-                result = score_listing(row, facts, config)
+                result = score_listing(row, facts, config, as_of=as_of, strict_distribution=strict_distribution)
                 storage.update_listing_score(
                     path=db_path,
                     listing_id=row["id"],

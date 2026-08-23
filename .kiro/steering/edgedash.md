@@ -120,3 +120,77 @@ Trigger (scheduled)
 - Plain, readable Python over clever or overly concise Python.
 - When asked to build one module, build that module only — do not scaffold the
   whole application unless explicitly asked.
+
+## AGGREGATE ANALYSIS
+
+22. Aggregate analysis is deterministic SQL and Python. No LLM call may
+    produce, adjust, or rank an aggregate number. A model may only
+    SUGGEST canonical groupings for a human to approve.
+
+23. Skill names are canonicalised through an explicit alias map in config.yaml
+    that I own and can read. Never auto-merge skill names by model judgement or
+    string similarity alone.
+
+24. Gap ranking is weighted by the fit score of the listing the gap came
+    from. A gap in a listing I score 20 on is worth far less than a gap in a
+    listing I score 85 on. Never rank gaps by raw frequency alone.
+
+25. Every gap report run writes a timestamped SNAPSHOT. Never overwrite the
+    previous report. Trend over time is a first-class output, not an
+    afterthought.
+
+26. Every aggregate number must be traceable to the rows that produced
+    it. Any reported gap must be able to list the specific listing IDs it was
+    computed from. No number appears in the dashboard that I cannot drill into.
+
+27. Report the sample size alongside every aggregate. A gap computed from
+    3 listings and a gap computed from 90 listings must never be presented as
+    equally reliable.
+
+## ORCHESTRATION
+
+28. The Orchestrator reads system state and decides which agents to run.
+    It never runs a fixed sequence. Skipping an agent because there is no
+    work for it is a SUCCESSFUL outcome, not a failure.
+
+29. Every delegation carries an explicit goal and an explicit stop
+    condition (max items, max duration). A sub-agent never decides its own
+    limits — the Orchestrator sets them.
+
+30. The Orchestrator never does an agent's work. It reads state,
+    delegates, collects results, logs. No fetching, scoring, or analysis
+    logic in the Orchestrator.
+
+31. The Orchestrator prints and logs its PLAN before executing it —
+    which agents will run, which are skipped, and the state value that
+    caused each decision.
+
+32. One sub-agent failing does not stop the cycle. Log the failure,
+    continue with the remaining plan, and mark the cycle partial.
+
+33. Every cycle writes exactly one summary row: what ran, what was
+    skipped, why, duration per agent, and the outcome.
+
+## VERIFICATION
+
+34. The Verifier judges output plausibility and NEVER repairs, rewrites,
+    or adjusts data. It returns a verdict and a reason. The Orchestrator
+    decides what to do about a failure.
+
+35. Verification checks plausibility, never correctness. There is no
+    ground truth for a fit score. Checks assert properties of the output
+    distribution and shape, not the accuracy of any single value.
+
+36. A failed verification triggers at most ONE retry of the failing agent
+    with adjusted context. After that the cycle is marked "degraded" and
+    stops. Never retry in an unbounded loop.
+
+37. Every verdict is logged to cycle_log with the check that failed and
+    the observed value that failed it — never just "failed".
+
+38. Only cycles with a passing verdict may be read by the dashboard. A
+    failed cycle must never overwrite the last known-good data. Stale
+    verified data always beats fresh unverified data.
+
+39. Verification thresholds live in config.yaml, not in code, and every
+    threshold has a comment saying what failure it is designed to catch.

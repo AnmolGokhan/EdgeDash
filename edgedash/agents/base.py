@@ -14,6 +14,7 @@ class AgentResult:
     status: str          # "ok" | "failed"
     records_touched: int
     notes: str | None = None
+    verdict: object | None = None
 
 
 @runtime_checkable
@@ -26,5 +27,11 @@ class Agent(Protocol):
 
     name: str
 
-    def run(self, config: Config, db_path: str) -> AgentResult:
+    def run(
+        self,
+        config: Config,
+        db_path: str,
+        goal: str,
+        stop_conditions: dict[str, int],
+    ) -> AgentResult:
         ...
