@@ -345,9 +345,9 @@ def _run_check() -> None:
 
     try:
         result = complete_json(test_prompt, schema)
-        print(f"  ✓ Connection OK — response: {result}")
+        print(f"  [OK] Connection OK — response: {result}")
     except LLMError as exc:
-        print(f"  ✗ FAILED — {exc}")
+        print(f"  [FAIL] FAILED — {exc}")
         raise SystemExit(1) from exc
 
 

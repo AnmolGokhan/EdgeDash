@@ -99,6 +99,16 @@ CREATE TABLE IF NOT EXISTS cycle_log (
     status          TEXT    NOT NULL,
     notes           TEXT
 );
+
+CREATE TABLE IF NOT EXISTS query_log (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    question        TEXT NOT NULL,
+    tool_chosen     TEXT,
+    params          TEXT NOT NULL,
+    answerable      INTEGER NOT NULL,
+    duration        REAL NOT NULL,
+    created_at      TEXT NOT NULL
+);
 """
 
 
@@ -427,6 +437,51 @@ def clear_listing_scores(path: str, listing_id: str | None = None) -> int:
     return int(cursor.rowcount)
 
 
+def clear_all_data(path: str) -> None:
+    """Remove all stored job data while preserving the database schema."""
+    with _connect(path) as conn:
+        conn.execute("DELETE FROM listings")
+        conn.execute("DELETE FROM extraction_cache")
+        conn.execute("DELETE FROM skill_gaps")
+        conn.execute("DELETE FROM cycle_log")
+
+
+def get_data_counts(path: str) -> dict[str, int]:
+    """Return row counts for stored data tables without loading their contents."""
+    with _connect_readonly(path) as conn:
+        return {
+            table: int(conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+            for table in ("listings", "extraction_cache", "skill_gaps", "cycle_log")
+        }
+
+
+def log_query(
+    path: str,
+    question: str,
+    tool_chosen: str | None,
+    params: dict[str, Any],
+    answerable: bool,
+    duration: float,
+) -> None:
+    """Record one natural-language query for operational auditing."""
+    with _connect(path) as conn:
+        conn.execute(
+            """
+            INSERT INTO query_log
+                (question, tool_chosen, params, answerable, duration, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                question,
+                tool_chosen,
+                json.dumps(params, sort_keys=True),
+                int(answerable),
+                duration,
+                _now_iso(),
+            ),
+        )
+
+
 def get_listing_diagnostics(path: str) -> dict[str, Any]:
     """Return a read-only summary of listings for operational diagnostics."""
     with _connect(path) as conn:
@@ -567,6 +622,168 @@ def get_latest_passing_cycle(path: str) -> dict[str, Any] | None:
             """
         ).fetchone()
     return dict(row) if row is not None else None
+
+
+def get_query_snapshot(path: str) -> dict[str, Any] | None:
+    """Return the latest passing-cycle cutoff and its gap snapshot id."""
+    with _connect_readonly(path) as conn:
+        cycle = conn.execute(
+            """
+            SELECT finished_at FROM cycle_log
+            WHERE agent = 'Orchestrator/Summary' AND status = 'complete'
+            ORDER BY id DESC LIMIT 1
+            """
+        ).fetchone()
+        if cycle is None:
+            return None
+        gap = conn.execute(
+            """
+            SELECT run_id, computed_at FROM skill_gaps
+            WHERE computed_at <= ?
+            ORDER BY computed_at DESC LIMIT 1
+            """,
+            (cycle["finished_at"],),
+        ).fetchone()
+    return {
+        "finished_at": cycle["finished_at"],
+        "gap_run_id": gap["run_id"] if gap else None,
+        "gap_computed_at": gap["computed_at"] if gap else None,
+    }
+
+
+def query_companies_hiring(path: str, cutoff: str, since: str) -> list[dict[str, Any]]:
+    with _connect_readonly(path) as conn:
+        rows = conn.execute(
+            """
+            SELECT company, COUNT(*) AS count
+            FROM listings
+            WHERE fetched_at <= ? AND posted_at >= ?
+            GROUP BY company ORDER BY count DESC, company
+            """,
+            (cutoff, since),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def query_best_matches(path: str, cutoff: str, limit: int) -> list[dict[str, Any]]:
+    with _connect_readonly(path) as conn:
+        rows = conn.execute(
+            """
+            SELECT title, company, fit_score AS score, fit_reason AS reason
+            FROM listings WHERE fit_score IS NOT NULL AND scored_at <= ?
+            ORDER BY fit_score DESC, id LIMIT ?
+            """,
+            (cutoff, limit),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def query_top_gaps(path: str, run_id: str | None, limit: int) -> list[dict[str, Any]]:
+    if run_id is None:
+        return []
+    with _connect_readonly(path) as conn:
+        rows = conn.execute(
+            """
+            SELECT skill, listings_blocked, opportunity_cost
+            FROM skill_gaps WHERE run_id = ?
+            ORDER BY opportunity_cost DESC, skill LIMIT ?
+            """,
+            (run_id, limit),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def query_gap_detail(path: str, cutoff: str, skill: str, aliases: dict[str, str]) -> list[dict[str, Any]]:
+    with _connect_readonly(path) as conn:
+        listings = conn.execute(
+            """
+            SELECT id, title, company, fit_score, fit_reason, description
+            FROM listings WHERE fit_score IS NOT NULL AND scored_at <= ?
+            ORDER BY fit_score DESC, id
+            """,
+            (cutoff,),
+        ).fetchall()
+        cache = conn.execute("SELECT description_hash, payload FROM extraction_cache").fetchall()
+    facts_by_hash = {row["description_hash"]: json.loads(row["payload"]) for row in cache}
+    result = []
+    for listing in listings:
+        digest = hashlib.sha256((listing["description"] or "").strip().encode("utf-8")).hexdigest()
+        facts = facts_by_hash.get(digest, {})
+        required = facts.get("required_skills", [])
+        if any(_canonical_skill(value, aliases) == skill for value in required):
+            result.append({key: listing[key] for key in ("id", "title", "company", "fit_score", "fit_reason")})
+    return result
+
+
+def query_trend(path: str, cutoff: str, since: str) -> list[dict[str, Any]]:
+    with _connect_readonly(path) as conn:
+        rows = conn.execute(
+            """
+            SELECT computed_at, skill, opportunity_cost
+            FROM skill_gaps WHERE computed_at <= ? AND computed_at >= ?
+            ORDER BY computed_at ASC, skill
+            """,
+            (cutoff, since),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def query_listing_count(path: str, cutoff: str) -> list[dict[str, Any]]:
+    with _connect_readonly(path) as conn:
+        row = conn.execute(
+            """
+            SELECT COUNT(*) AS listings,
+                   SUM(CASE WHEN fit_score IS NOT NULL AND scored_at <= ? THEN 1 ELSE 0 END) AS scored,
+                   SUM(CASE WHEN fit_score IS NULL THEN 1 ELSE 0 END) AS unscored,
+                   MAX(posted_at) AS newest_listing_date
+            FROM listings WHERE fetched_at <= ?
+            """,
+            (cutoff, cutoff),
+        ).fetchone()
+    return [dict(row)]
+
+
+def query_skill_demand(path: str, cutoff: str, skill: str, aliases: dict[str, str]) -> list[dict[str, Any]]:
+    with _connect_readonly(path) as conn:
+        listings = conn.execute(
+            "SELECT description FROM listings WHERE fetched_at <= ?", (cutoff,)
+        ).fetchall()
+        cache = conn.execute("SELECT description_hash, payload FROM extraction_cache").fetchall()
+    facts_by_hash = {row["description_hash"]: json.loads(row["payload"]) for row in cache}
+    required = nice = 0
+    for listing in listings:
+        digest = hashlib.sha256((listing["description"] or "").strip().encode("utf-8")).hexdigest()
+        facts = facts_by_hash.get(digest, {})
+        required += any(_canonical_skill(value, aliases) == skill for value in facts.get("required_skills", []))
+        nice += any(_canonical_skill(value, aliases) == skill for value in facts.get("nice_to_have", []))
+    return [{"skill": skill, "required": required, "nice_to_have": nice}]
+
+
+def query_skill_exists(path: str, cutoff: str, skill: str, aliases: dict[str, str]) -> bool:
+    """Return whether a canonical skill occurs in verified extracted facts."""
+    with _connect_readonly(path) as conn:
+        listings = conn.execute(
+            "SELECT description FROM listings WHERE fetched_at <= ?", (cutoff,)
+        ).fetchall()
+        cache = conn.execute("SELECT description_hash, payload FROM extraction_cache").fetchall()
+    facts_by_hash = {row["description_hash"]: json.loads(row["payload"]) for row in cache}
+    for listing in listings:
+        digest = hashlib.sha256((listing["description"] or "").strip().encode("utf-8")).hexdigest()
+        facts = facts_by_hash.get(digest, {})
+        values = facts.get("required_skills", []) + facts.get("nice_to_have", [])
+        if any(_canonical_skill(value, aliases) == skill for value in values):
+            return True
+    return False
+
+
+def _canonical_skill(value: str, aliases: dict[str, str]) -> str:
+    value = value.strip().lower()
+    normalised_aliases = {
+        key.strip().lower().strip(".,;:!?()[]{}"):
+        target.strip().lower().strip(".,;:!?()[]{}")
+        for key, target in aliases.items()
+    }
+    return normalised_aliases.get(value, value)
 
 
 def get_cycle_activity(path: str, limit: int = 30) -> list[dict[str, Any]]:

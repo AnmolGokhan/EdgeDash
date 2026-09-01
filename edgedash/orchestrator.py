@@ -72,14 +72,14 @@ def _fmt_time(iso: str | None) -> str:
     return iso[:19].replace("T", " ") + " UTC"
 
 
-def _print_rule(char: str = "─", width: int = 62) -> None:
+def _print_rule(char: str = "-", width: int = 62) -> None:
     print(char * width)
 
 
 def _print_header(title: str) -> None:
-    _print_rule("═")
+    _print_rule("=")
     print(f"  {title}")
-    _print_rule("═")
+    _print_rule("=")
 
 
 # ---------------------------------------------------------------------------
@@ -121,7 +121,7 @@ def run_cycle(
 ) -> None:
     """Execute one full orchestration cycle."""
 
-    _print_header("EdgeDash  ·  Cycle Starting")
+    _print_header("EdgeDash  .  Cycle Starting")
     print(f"  Role   : {config.target_role}")
     print(f"  City   : {config.target_city}")
     print(f"  DB     : {config.db_path}")
@@ -209,7 +209,7 @@ def run_cycle(
             notes=result.notes,
         )
 
-        status_icon = "✓" if result.status == "ok" else "✗"
+        status_icon = "[OK]" if result.status == "ok" else "[FAIL]"
         print(f"{status_icon}")
         if result.notes:
             print(f"    {result.notes}")
@@ -265,7 +265,7 @@ def run_cycle(
             retry_result.status,
             retry_result.notes,
         )
-        print("✓" if retry_result.status == "ok" else "✗")
+        print("[OK]" if retry_result.status == "ok" else "[FAIL]")
         results.append(retry_result)
         if retry_result.status == "failed":
             outcome_override = "degraded"
@@ -294,7 +294,7 @@ def run_cycle(
             verify_result.status,
             verify_result.notes,
         )
-        print("✓" if verify_result.status == "ok" else "✗")
+        print("[OK]" if verify_result.status == "ok" else "[FAIL]")
         results.append(verify_result)
         if verify_result.status == "failed" or not verify_result.verdict or not verify_result.verdict.passed:
             outcome_override = "degraded"
@@ -307,7 +307,7 @@ def run_cycle(
     _print_rule()
     col = 18
     print(f"  {'Agent':<{col}} {'Status':<8} {'New records':>12}  Notes")
-    _print_rule("─")
+    _print_rule("-")
     for r in results:
         notes_preview = (r.notes or "")[:40]
         print(f"  {r.agent:<{col}} {r.status:<8} {r.records_touched:>12}  {notes_preview}")
@@ -331,5 +331,5 @@ def run_cycle(
         status=outcome,
         notes=summary,
     )
-    _print_rule("═")
+    _print_rule("=")
     print()

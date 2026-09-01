@@ -6,6 +6,7 @@ import streamlit as st
 
 import edgedash.storage as storage
 from edgedash.config import load_config
+from edgedash.query.ask import ask
 
 
 st.set_page_config(page_title="EdgeDash Activity", page_icon="ED", layout="wide")
@@ -28,6 +29,8 @@ def _status(value: str | None) -> str:
 
 def main() -> None:
     config = load_config()
+    # Ensure database is initialized with all tables
+    storage.init_db(config.db_path)
     try:
         dashboard = read_dashboard(config.db_path)
     except Exception as exc:
@@ -74,6 +77,26 @@ def main() -> None:
     with right:
         st.subheader("Current top 10 skill gaps")
         st.dataframe((data or {}).get("gaps", []), use_container_width=True, hide_index=True)
+
+    st.header("Ask your data")
+    examples = [
+        "Which companies are hiring?",
+        "What are my top skill gaps?",
+        "Show me my best matches",
+    ]
+    selected = st.session_state.get("query_question", "")
+    for example in examples:
+        if st.button(example, key=f"example_{example}"):
+            selected = example
+            st.session_state["query_question"] = example
+    question = st.text_input("Question", value=selected, key="query_input")
+    if question:
+        try:
+            answer = ask(question)
+            st.write(answer.text)
+            st.dataframe(answer.rows, use_container_width=True, hide_index=True)
+        except Exception as exc:
+            st.error(f"Question could not be answered: {exc}")
 
 
 if __name__ == "__main__":

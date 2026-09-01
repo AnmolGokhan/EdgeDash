@@ -27,9 +27,9 @@ _REPO_ROOT = Path(__file__).parent.parent
 _CONFIG_PATH = _REPO_ROOT / "config.yaml"
 
 _DEFAULTS: dict[str, Any] = {
-    "target_role": "Data Analyst",
+    "target_role": "AI Engineer",
     "target_city": "Bengaluru",
-    "target_seniority": "mid",
+    "target_seniority": "fresher",
     "keywords": [],
     "my_skills": [],
     "skills": [],
