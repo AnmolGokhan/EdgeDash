@@ -13,6 +13,15 @@ from edgedash.llm import complete_json
 from edgedash.query.tools import TOOLS
 
 
+_MAX_QUESTION_LENGTH = 300
+_SUSPICIOUS_PHRASES = (
+    "ignore previous instructions",
+    "ignore prior instructions",
+    "system prompt",
+    "jailbreak",
+)
+
+
 @dataclass(frozen=True)
 class Answer:
     text: str
@@ -57,6 +66,25 @@ def _unanswerable() -> Answer:
     return Answer(f"That question cannot be answered by the available tools. You can ask: {descriptions}", [], None, {})
 
 
+def _session_rate_limit_status(now: float | None = None) -> tuple[bool, int]:
+    return True, 0
+
+
+def _rejection_reason(question: str) -> str | None:
+    stripped = question.strip()
+    if not stripped:
+        return "rejected: empty input"
+    if len(question) > _MAX_QUESTION_LENGTH:
+        return "rejected: input too long"
+    lowered = stripped.lower()
+    if any(phrase in lowered for phrase in _SUSPICIOUS_PHRASES):
+        return "rejected: suspicious input"
+    allowed, _ = _session_rate_limit_status()
+    if not allowed:
+        return "rejected: rate limited"
+    return None
+
+
 def _validate_params(tool_name: str, params: dict[str, Any]) -> dict[str, Any]:
     spec = TOOLS[tool_name]["parameters"]
     unknown = set(params) - set(spec)
@@ -83,7 +111,15 @@ def ask(question: str) -> Answer:
     tool_name: str | None = None
     params: dict[str, Any] = {}
     answerable = False
+    rejection = _rejection_reason(question)
+    if rejection is not None:
+        params = {"rejection": rejection}
     try:
+        if rejection is not None:
+            if rejection == "rejected: rate limited":
+                _, remaining = _session_rate_limit_status()
+                return Answer(f"Please wait {remaining} seconds before asking another question.", [], None, {})
+            return _unanswerable()
         route = complete_json(_routing_prompt(question), _ROUTE_SCHEMA)
         tool_name = route.get("tool")
         params = route.get("params") or {}

@@ -1,18 +1,107 @@
-"""Single storage module — the only place sqlite3 is imported.
-
-Swapping to Postgres in week 4 means replacing this file only.
-Every other module calls these functions; none import a DB driver directly.
-"""
+"""Single storage module for SQLite development and hosted Postgres."""
 
 from __future__ import annotations
 
 import hashlib
 import json
+import logging
+import os
+import re
 import sqlite3
+import sys
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Generator, Sequence
+
+
+logger = logging.getLogger(__name__)
+_TABLES = ("listings", "extraction_cache", "skill_gaps", "cycle_log", "query_log")
+
+
+class _Row(dict[str, Any]):
+    """Mapping row that preserves SQLite's integer-index access on Postgres."""
+
+    def __init__(self, columns: Sequence[str], values: Sequence[Any]) -> None:
+        super().__init__(zip(columns, values))
+        self._columns = tuple(columns)
+
+    def __getitem__(self, key: int | str) -> Any:
+        if isinstance(key, int):
+            return super().__getitem__(self._columns[key])
+        return super().__getitem__(key)
+
+
+class _PostgresCursor:
+    def __init__(self, cursor: Any) -> None:
+        self._cursor = cursor
+        self.rowcount = cursor.rowcount
+
+    def _row(self, row: Any) -> _Row | None:
+        if row is None:
+            return None
+        columns = [column.name for column in self._cursor.description]
+        return _Row(columns, row)
+
+    def fetchone(self) -> _Row | None:
+        return self._row(self._cursor.fetchone())
+
+    def fetchall(self) -> list[_Row]:
+        return [self._row(row) for row in self._cursor.fetchall()]
+
+
+class _PostgresConnection:
+    def __init__(self, connection: Any) -> None:
+        self._connection = connection
+
+    def execute(self, query: str, parameters: Sequence[Any] = ()) -> _PostgresCursor:
+        adapted_parameters = parameters if isinstance(parameters, dict) else tuple(parameters)
+        cursor = self._connection.execute(_postgres_sql(query), adapted_parameters)
+        return _PostgresCursor(cursor)
+
+    def executemany(self, query: str, parameters: Sequence[Sequence[Any]]) -> None:
+        with self._connection.cursor() as cursor:
+            cursor.executemany(_postgres_sql(query), parameters)
+
+    def commit(self) -> None:
+        self._connection.commit()
+
+    def rollback(self) -> None:
+        self._connection.rollback()
+
+    def close(self) -> None:
+        self._connection.close()
+
+
+_NAMED_PARAMETER = re.compile(r":([A-Za-z_][A-Za-z0-9_]*)")
+
+
+def _postgres_sql(query: str) -> str:
+    """Translate SQLite-style placeholders to psycopg placeholders."""
+    query = _NAMED_PARAMETER.sub(r"%(\1)s", query)
+    return query.replace("?", "%s")
+
+
+def _database_url() -> str | None:
+    return os.getenv("DATABASE_URL") or None
+
+
+def _backend_name() -> str:
+    return "Postgres" if _database_url() else "SQLite"
+
+
+def _log_backend() -> None:
+    logger.info("EdgeDash storage backend: %s", _backend_name())
+
+
+def _postgres_connection() -> _PostgresConnection:
+    try:
+        import psycopg
+    except ImportError as error:
+        raise RuntimeError(
+            "DATABASE_URL is set but the optional psycopg package is not installed"
+        ) from error
+    return _PostgresConnection(psycopg.connect(_database_url(), connect_timeout=10))
 
 
 # ---------------------------------------------------------------------------
@@ -24,10 +113,12 @@ def _now_iso() -> str:
 
 
 @contextmanager
-def _connect(path: str) -> Generator[sqlite3.Connection, None, None]:
-    conn = sqlite3.connect(path)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
+def _connect(path: str) -> Generator[Any, None, None]:
+    _log_backend()
+    conn = _postgres_connection() if _database_url() else sqlite3.connect(path)
+    if isinstance(conn, sqlite3.Connection):
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
     try:
         yield conn
         conn.commit()
@@ -39,11 +130,15 @@ def _connect(path: str) -> Generator[sqlite3.Connection, None, None]:
 
 
 @contextmanager
-def _connect_readonly(path: str) -> Generator[sqlite3.Connection, None, None]:
-    """Open SQLite without allowing a read-only diagnostic to write."""
-    uri = f"file:{Path(path).resolve().as_posix()}?mode=ro"
-    conn = sqlite3.connect(uri, uri=True)
-    conn.row_factory = sqlite3.Row
+def _connect_readonly(path: str) -> Generator[Any, None, None]:
+    """Open a connection for a read-only operation."""
+    _log_backend()
+    if _database_url():
+        conn = _postgres_connection()
+    else:
+        uri = f"file:{Path(path).resolve().as_posix()}?mode=ro"
+        conn = sqlite3.connect(uri, uri=True)
+        conn.row_factory = sqlite3.Row
     try:
         yield conn
     finally:
@@ -112,12 +207,48 @@ CREATE TABLE IF NOT EXISTS query_log (
 """
 
 
-def _migrate_extraction_cache(conn: sqlite3.Connection) -> None:
-    """Safely add the extraction cache table/columns on older SQLite databases."""
-    table_exists = conn.execute(
-        "SELECT name FROM sqlite_master WHERE type='table' AND name='extraction_cache'"
-    ).fetchone()
-    if table_exists is None:
+def _ddl_statements() -> list[str]:
+    ddl = _DDL
+    if _database_url():
+        ddl = ddl.replace(
+            "INTEGER PRIMARY KEY AUTOINCREMENT",
+            "BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY",
+        )
+        ddl = ddl.replace(
+            "also_nice_to_have   INTEGER NOT NULL DEFAULT 0",
+            "also_nice_to_have   BOOLEAN NOT NULL DEFAULT FALSE",
+        ).replace(
+            "answerable      INTEGER NOT NULL",
+            "answerable      BOOLEAN NOT NULL",
+        )
+    return [statement.strip() for statement in ddl.split(";") if statement.strip()]
+
+
+def _table_exists(conn: Any, table: str) -> bool:
+    if _database_url():
+        return conn.execute(
+            "SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = ?",
+            (table,),
+        ).fetchone() is not None
+    return conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name=?", (table,)
+    ).fetchone() is not None
+
+
+def _table_columns(conn: Any, table: str) -> set[str]:
+    if _database_url():
+        rows = conn.execute(
+            "SELECT column_name FROM information_schema.columns WHERE table_schema = 'public' AND table_name = ?",
+            (table,),
+        ).fetchall()
+        return {row[0] for row in rows}
+    return {row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+
+
+def _migrate_extraction_cache(conn: Any) -> None:
+    """Safely add the extraction cache table/columns on older databases."""
+    table_exists = _table_exists(conn, "extraction_cache")
+    if not table_exists:
         conn.execute(
             """
             CREATE TABLE extraction_cache (
@@ -129,9 +260,7 @@ def _migrate_extraction_cache(conn: sqlite3.Connection) -> None:
         )
         return
 
-    columns = {
-        row[1] for row in conn.execute("PRAGMA table_info(extraction_cache)").fetchall()
-    }
+    columns = _table_columns(conn, "extraction_cache")
     if "payload" not in columns:
         conn.execute(
             "ALTER TABLE extraction_cache ADD COLUMN payload TEXT NOT NULL DEFAULT '{}'"
@@ -142,11 +271,9 @@ def _migrate_extraction_cache(conn: sqlite3.Connection) -> None:
         )
 
 
-def _migrate_listing_scores(conn: sqlite3.Connection) -> None:
+def _migrate_listing_scores(conn: Any) -> None:
     """Add score columns to databases created before component scoring."""
-    columns = {
-        row[1] for row in conn.execute("PRAGMA table_info(listings)").fetchall()
-    }
+    columns = _table_columns(conn, "listings")
     for name, definition in (
         ("scored_at", "TEXT"),
         ("components", "TEXT"),
@@ -155,8 +282,8 @@ def _migrate_listing_scores(conn: sqlite3.Connection) -> None:
             conn.execute(f"ALTER TABLE listings ADD COLUMN {name} {definition}")
 
 
-def _migrate_skill_gaps(conn: sqlite3.Connection) -> None:
-    columns = {row[1] for row in conn.execute("PRAGMA table_info(skill_gaps)").fetchall()}
+def _migrate_skill_gaps(conn: Any) -> None:
+    columns = _table_columns(conn, "skill_gaps")
     if columns and "run_id" not in columns:
         conn.execute("ALTER TABLE skill_gaps RENAME TO skill_gaps_legacy")
         conn.execute(
@@ -175,7 +302,8 @@ def _migrate_skill_gaps(conn: sqlite3.Connection) -> None:
 def init_db(path: str) -> None:
     """Create all tables if they do not already exist."""
     with _connect(path) as conn:
-        conn.executescript(_DDL)
+        for statement in _ddl_statements():
+            conn.execute(statement)
         _migrate_listing_scores(conn)
         _migrate_skill_gaps(conn)
         _migrate_extraction_cache(conn)
@@ -210,14 +338,15 @@ def upsert_listings(path: str, rows: Sequence[dict[str, Any]]) -> int:
             listing_id = make_listing_id(row["source"], row["url"])
             cursor = conn.execute(
                 """
-                INSERT OR IGNORE INTO listings
+                INSERT INTO listings
                     (id, title, company, location, url,
                      description, source, posted_at, fetched_at,
                      fit_score, fit_reason)
                 VALUES
                     (:id, :title, :company, :location, :url,
-                     :description, :source, :posted_at, :fetched_at,
-                     :fit_score, :fit_reason)
+                    :description, :source, :posted_at, :fetched_at,
+                    :fit_score, :fit_reason)
+                ON CONFLICT(id) DO NOTHING
                 """,
                 {
                     "id": listing_id,
@@ -274,16 +403,16 @@ def set_extraction_cache(path: str, description_hash: str, payload: dict[str, An
 def get_extracted_skill_counts(path: str) -> list[dict[str, Any]]:
     """Return raw required-skill counts from extraction cache payloads."""
     with _connect_readonly(path) as conn:
-        rows = conn.execute(
-            """
-            SELECT json_each.value AS skill, COUNT(*) AS count
-            FROM extraction_cache, json_each(extraction_cache.payload, '$.required_skills')
-            WHERE json_each.type = 'text'
-            GROUP BY json_each.value
-            ORDER BY count DESC, skill COLLATE NOCASE
-            """
-        ).fetchall()
-    return [dict(row) for row in rows]
+        rows = conn.execute("SELECT payload FROM extraction_cache").fetchall()
+    counts: dict[str, int] = {}
+    for row in rows:
+        for skill in json.loads(row[0]).get("required_skills", []):
+            if isinstance(skill, str):
+                counts[skill] = counts.get(skill, 0) + 1
+    return [
+        {"skill": skill, "count": count}
+        for skill, count in sorted(counts.items(), key=lambda item: (-item[1], item[0].lower()))
+    ]
 
 
 def get_scored_listings_with_facts(path: str) -> list[dict[str, Any]]:
@@ -319,7 +448,8 @@ def write_skill_gap_snapshot(path: str, run_id: str, computed_at: str, rows: Seq
                 (
                     run_id, computed_at, row["skill"], row["listings_blocked"],
                     row["opportunity_cost"], row["mean_score"], row["top_score"],
-                    json.dumps(row["example_ids"]), row["also_nice_to_have"],
+                    json.dumps(row["example_ids"]),
+                    bool(row["also_nice_to_have"]) if _database_url() else row["also_nice_to_have"],
                 )
                 for row in rows
             ],
@@ -475,7 +605,7 @@ def log_query(
                 question,
                 tool_chosen,
                 json.dumps(params, sort_keys=True),
-                int(answerable),
+                bool(answerable) if _database_url() else int(answerable),
                 duration,
                 _now_iso(),
             ),
@@ -920,3 +1050,39 @@ def get_listings(
         rows = conn.execute(query, params).fetchall()
 
     return [dict(row) for row in rows]
+
+
+def _check_backend(path: str) -> int:
+    backend = _backend_name()
+    print(f"backend: {backend}")
+    try:
+        init_db(path)
+        with _connect_readonly(path) as conn:
+            print("connected: yes")
+            for table in _TABLES:
+                count = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+                print(f"{table}: {count}")
+    except Exception as error:
+        print(f"connected: no ({type(error).__name__}: {error})")
+        return 1
+    return 0
+
+
+def _main(arguments: Sequence[str]) -> int:
+    if arguments == ["--migrate"]:
+        path = os.getenv("EDGEDASH_DB_PATH", "edgedash.db")
+        try:
+            init_db(path)
+        except Exception as error:
+            print(f"migration failed: {type(error).__name__}: {error}")
+            return 1
+        print(f"migration complete ({_backend_name()})")
+        return 0
+    if arguments == ["--check"]:
+        return _check_backend(os.getenv("EDGEDASH_DB_PATH", "edgedash.db"))
+    print("usage: python -m edgedash.storage --migrate | --check")
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(_main(sys.argv[1:]))

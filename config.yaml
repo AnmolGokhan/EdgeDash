@@ -102,7 +102,7 @@ llm_model: "gemini-3.6-flash"   # model name passed to the provider
 llm_requests_per_minute: 15     # free-tier cap; lower if you see 429s
 
 # Scoring
-scoring_batch_size: 25          # max listings scored per cycle (rule 21)
+scoring_batch_size: 5          # max listings scored per cycle (rule 21)
 fetch_interval_hours: 6
 max_pages: 5
 max_listings: 500
