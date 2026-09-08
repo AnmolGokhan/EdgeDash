@@ -16,8 +16,9 @@ Config -> Orchestrator -> Fetcher / MockFetcher
 - Uses a mock fetcher for safe offline development.
 - Extracts job facts and required skills with an LLM-backed extraction layer.
 - Scores listings against your configured target role, city, seniority, and skill profile.
-- Validates cycle quality with verification checks such as score spread, freshness, and gap-sample thresholds.
-- Stores verified snapshots in SQLite and shows the latest successful cycle in a read-only dashboard.
+- Validates cycle quality with deterministic checks for score spread, extraction sanity, and freshness. A small or missing gap sample is reported as insufficient-data warning information and does not fail the cycle.
+- Re-evaluates the scorer and gap-analysis tasks once after a successful fetch so planning reflects newly fetched listings.
+- Stores cycle logs and verified snapshots through the configured SQLite or Postgres backend. The read-only dashboard keeps the latest passing-cycle snapshot stable while also showing current live database totals.
 - Lets you ask natural-language questions like “show my best matches” or “what are my top skill gaps?” using a deterministic tool registry.
 
 ## Current project status
@@ -28,6 +29,8 @@ Config -> Orchestrator -> Fetcher / MockFetcher
 - [x] Read-only Streamlit dashboard
 - [x] Deterministic skill canonicalization and alias management
 - [x] Verification retry/degraded-cycle handling
+- [x] Post-fetch replanning and bounded agent timing instrumentation
+- [x] Scheduled GitHub Actions execution with manual dispatch
 - [x] Natural-language query routing over verified data
 - [x] CLI helpers for diagnostics, skill audits, and gap history
 
@@ -69,6 +72,8 @@ Then fill in values such as:
 
 The `edgedash/.env` file is gitignored.
 
+For hosted execution, configure `DATABASE_URL` and `GEMINI_API_KEY` as GitHub Actions repository secrets. The workflow runs the database migration and one cycle daily at 00:30 UTC, and can also be started manually from GitHub Actions.
+
 4. Edit `config.yaml` to match your target role, city, skills, and source settings.
 
 ## Running a cycle
@@ -78,6 +83,8 @@ Run one full cycle:
 ```bash
 python run_cycle.py
 ```
+
+The planner uses current database state to decide which agents are due. Fetching is followed by one post-fetch replan for scoring and gap analysis. Scoring is bounded by both `scoring_batch_size` and `score_max_seconds`; elapsed agent durations, retry durations, skipped agents, and failed checks are recorded in the orchestrator summary.
 
 Inspect the plan without executing or writing data:
 
@@ -117,10 +124,11 @@ python -m streamlit run app.py
 
 The dashboard reads the latest passing cycle from SQLite and shows:
 
-- total listings and scored listings
-- the latest verified top matches
-- the current top skill gaps
-- recent cycle activity plus failed or degraded events
+- the latest passing-cycle snapshot totals alongside live database totals
+- the verified top matches and skill gaps from the latest passing-cycle snapshot
+- recent cycle activity, including failed, partial, and degraded events
+
+If the newest cycle is not passing verification, the dashboard continues showing the earlier passing snapshot and identifies that the newest cycle did not pass. A `partial` cycle indicates that an agent failed during execution; a `degraded` cycle indicates that verification remained unsuccessful after the available retry path.
 
 ## Natural-language query layer
 
@@ -163,7 +171,7 @@ edgedash/
   planning.py          # agent planning logic
   skills.py            # canonical skill audit and alias suggestions
   verdicts.py          # cycle verification history
-  storage.py           # SQLite persistence and query helpers
+  storage.py           # SQLite/Postgres persistence and query helpers
   query/
     ask.py             # natural-language query pipeline
     tools.py           # deterministic query tools
@@ -181,7 +189,8 @@ tests/                 # project test suite
 - Storage is isolated behind one module so it can be swapped from SQLite to a hosted database later without rewriting the rest of the app.
 - Listing IDs are stable hashes of source and URL to reduce duplicate listings across runs.
 - Skill aliases are explicit and user-owned in `config.yaml`; suggestions are printed for review and are never applied automatically.
-- Verification is intentionally conservative: a failed run can be retried once, but a second failure degrades the cycle rather than pretending the output is valid.
+- Verification is intentionally conservative: score-spread, extraction-sanity, and freshness failures can trigger one targeted retry, but a second failure degrades the cycle rather than presenting it as verified. Gap-sample size is warning-only because insufficient supporting data is not itself a plausibility failure.
+- Cycle summaries record per-agent timing, retry timing, skipped work, failed checks, and the final outcome (`complete`, `partial`, `degraded`, or `nothing_to_do`).
 - The application is designed as a read-only decision aid; model calls are limited to extraction and explicit alias review.
 
 ## Privacy and release safety
