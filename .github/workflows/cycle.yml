@@ -1,0 +1,119 @@
+name: EdgeDash cycle
+
+on:
+  schedule:
+    # 06:00 in IST corresponds to 00:30 UTC.
+    - cron: '30 0 * * *'
+  workflow_dispatch:
+
+jobs:
+  cycle:
+    name: Run EdgeDash cycle
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    env:
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run database migration
+        shell: bash
+        run: |
+          python - <<'PY'
+          import os
+          import subprocess
+          import sys
+
+          secrets = {
+              'DATABASE_URL': os.getenv('DATABASE_URL', ''),
+              'GEMINI_API_KEY': os.getenv('GEMINI_API_KEY', ''),
+          }
+
+          proc = subprocess.run(
+              [sys.executable, '-m', 'edgedash.storage', '--migrate'],
+              capture_output=True,
+              text=True,
+          )
+
+          combined = (proc.stdout or '') + ('\n' if proc.stderr and proc.stdout else '') + (proc.stderr or '')
+          for name, value in secrets.items():
+              if value:
+                  combined = combined.replace(value, f'[REDACTED_{name}]')
+
+          if proc.stdout:
+              print(proc.stdout.rstrip())
+          if proc.stderr:
+              print(proc.stderr.rstrip(), file=sys.stderr)
+
+          with open('cycle.log', 'a', encoding='utf-8') as fh:
+              fh.write('--- python -m edgedash.storage --migrate ---\n')
+              fh.write(combined)
+              if not combined.endswith('\n'):
+                  fh.write('\n')
+
+          raise SystemExit(proc.returncode)
+          PY
+
+      - name: Run EdgeDash cycle
+        shell: bash
+        run: |
+          python - <<'PY'
+          import os
+          import subprocess
+          import sys
+
+          secrets = {
+              'DATABASE_URL': os.getenv('DATABASE_URL', ''),
+              'GEMINI_API_KEY': os.getenv('GEMINI_API_KEY', ''),
+          }
+
+          proc = subprocess.run(
+              [sys.executable, 'run_cycle.py'],
+              capture_output=True,
+              text=True,
+          )
+
+          combined = (proc.stdout or '') + ('\n' if proc.stderr and proc.stdout else '') + (proc.stderr or '')
+          for name, value in secrets.items():
+              if value:
+                  combined = combined.replace(value, f'[REDACTED_{name}]')
+
+          if proc.stdout:
+              print(proc.stdout.rstrip())
+          if proc.stderr:
+              print(proc.stderr.rstrip(), file=sys.stderr)
+
+          with open('cycle.log', 'a', encoding='utf-8') as fh:
+              fh.write('\n--- python run_cycle.py ---\n')
+              fh.write(combined)
+              if not combined.endswith('\n'):
+                  fh.write('\n')
+
+          raise SystemExit(proc.returncode)
+          PY
+
+      - name: Upload cycle log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: edge-dash-cycle-log
+          path: cycle.log
+          if-no-files-found: warn
